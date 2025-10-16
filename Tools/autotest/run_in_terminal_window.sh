@@ -1,60 +1,94 @@
 #!/usr/bin/env bash
+# Tools/autotest/run_in_terminal_window.sh
+#
+# Purpose:
+#   Launch a command in an appropriate terminal; if no GUI/terminal is available,
+#   run it headless and log stdout/stderr to a file.
+#
+# Enhancements (PR):
+#   - Allow overriding fallback log path via env:
+#       * Preferred: RITW_LOGFILE or RITW_LOGDIR
+#       * Back-compat aliases: SITL_LOGFILE or SITL_LOGDIR
+#     Defaults to /tmp/<name>.log when unset.
+#   - Use 'command -v' instead of 'which' for portability.
+#   - Ensure parent directory exists for custom log path.
+#   - Keep subshell in fallback branch (required by upstream comment).
+#
+# Behavior:
+#   Unchanged unless the above env vars are set.
 
-# Try to run a command in an appropriate type of terminal window
-# depending on whats available
-# Sigh: theres no common way of handling command line args :-(
 name="$1"
 shift
 echo "RiTW: Starting $name : $*"
 
+# default minimize behavior for some terminals
 if [ -z "$SITL_RITW_MINIMIZE" ]; then
     SITL_RITW_MINIMIZE=1
 fi
 
 if [ -n "$SITL_RITW_TERMINAL" ]; then
-  # create a small shell script containing the command to run; this
-  # avoids problems where "screen" expects arguments in
-  # argv[1],argv[2],argv[3] where gnome-terminal expects the command
-  # to run be in argv[n+1] where argv[n] is "-e"
-  # this should work with:
-  # export SITL_RITW_TERMINAL="screen -D -m"
-  # export SITL_RITW_TERMINAL="gnome-terminal -e"
-  # export SITL_RITW_TERMINAL="konsole -e"
-
-  test -z "$TMPDIR" && TMPDIR="/tmp/"
-  FILENAME="ritw-`date '+%Y%m%d%H%M%S'`"
+  # Caller provided a terminal launcher (e.g. "screen -D -m", "gnome-terminal -e")
+  # Create a temp script so we can hand over argv cleanly across terminal variants
+  : "${TMPDIR:=/tmp}"
+  FILENAME="ritw-$(date '+%Y%m%d%H%M%S')"
   FILEPATH="$TMPDIR/$FILENAME"
   echo "#!/bin/sh" >"$FILEPATH"
   printf "%q " "$@" >>"$FILEPATH"
   chmod +x "$FILEPATH"
   $SITL_RITW_TERMINAL "$FILEPATH" &
+
 elif [ -n "$TMUX" ]; then
   tmux new-window -dn "$name" "$TMUX_PREFIX $*"
-elif [ -n "$DISPLAY" -a -n "$(which osascript)" ]; then
+
+elif [ -n "$DISPLAY" ] && command -v osascript >/dev/null 2>&1; then
+  # macOS: open a new Terminal window/tab and run the command
   osascript -e 'tell application "Terminal" to do script "'"cd $(pwd) && clear && $* "'"'
-elif [ -n "$DISPLAY" -a -n "$(which xterm)" ]; then
-  if [ $SITL_RITW_MINIMIZE -eq 1 ]; then
+
+elif [ -n "$DISPLAY" ] && command -v xterm >/dev/null 2>&1; then
+  if [ "$SITL_RITW_MINIMIZE" -eq 1 ]; then
       ICONIC=-iconic
   fi
-  xterm $ICONIC -xrm 'XTerm*selectToClipboard: true' -xrm 'XTerm*initialFont: 6' -n "$name" -name "$name" -T "$name" -hold -e $* &
-elif [ -n "$DISPLAY" -a -n "$(which konsole)" ]; then
+  xterm $ICONIC -xrm 'XTerm*selectToClipboard: true' -xrm 'XTerm*initialFont: 6' \
+        -n "$name" -name "$name" -T "$name" -hold -e $* &
+
+elif [ -n "$DISPLAY" ] && command -v konsole >/dev/null 2>&1; then
   konsole --hold -e $*
-elif [ -n "$DISPLAY" -a -n "$(which gnome-terminal)" ]; then
+
+elif [ -n "$DISPLAY" ] && command -v gnome-terminal >/dev/null 2>&1; then
   gnome-terminal -e "$*"
+
 elif [ -n "$STY" ]; then
-  # We are running inside of screen, try to start it there
+  # GNU screen session
   screen -X screen -t "$name" bash -c "cd $PWD; $*"
+
 elif [ -n "$ZELLIJ" ]; then
-  # Create a new pane to run
+  # zellij session
   zellij run -n "$name" -- "$1" "${@:2}"
+
 else
-  filename="/tmp/$name.log"
+  # ------------------------------
+  # Fallback: run headless + log
+  # ------------------------------
+  # Prefer generic RITW_*; accept SITL_* as aliases
+  LOGFILE="${RITW_LOGFILE:-${SITL_LOGFILE:-}}"
+  LOGDIR="${RITW_LOGDIR:-${SITL_LOGDIR:-}}"
+
+  if [ -n "$LOGFILE" ]; then
+      # Ensure parent dir exists if LOGFILE is specified
+      mkdir -p "$(dirname "$LOGFILE")" 2>/dev/null || true
+      filename="$LOGFILE"
+  elif [ -n "$LOGDIR" ]; then
+      mkdir -p "$LOGDIR" 2>/dev/null || true
+      filename="$LOGDIR/$name.log"
+  else
+      filename="/tmp/$name.log"
+  fi
+
   echo "RiTW: Window access not found, logging to $filename"
   cmd="$1"
   shift
-# the following "true" is to avoid bash optimising the following call
-# to avoid creating a subshell.  We need that subshell, or
-# _fdm_input_step sees ArduPilot has no parent and kills ArduPilot!
-  ( : ; "$cmd" $* &>"$filename" < /dev/null ) &
+  # Keep subshell (see upstream note: preserves parent for _fdm_input_step)
+  ( : ; "$cmd" "$@" &>"$filename" < /dev/null ) &
 fi
+
 exit 0
